@@ -1,0 +1,25 @@
+[package]
+name = "odbc-rust-proxy"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+axum = "0.8.9"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+odbc-api = "30.0.0"
+anyhow = "1.0"
+encoding_rs = "0.8"
+windows-service = "0.8"
+
+
+#https://github.com/johnthagen/min-sized-rust
+[profile.release]
+lto = true
+codegen-units = 1
+panic = 'unwind'
+strip = true
+rpath = true
+opt-level = "z" 
