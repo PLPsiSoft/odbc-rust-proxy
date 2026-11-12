@@ -29,7 +29,7 @@ use windows_service::{
 pub const SERVICE_NAME: &str = "PsiOdbcRustProxy";
 pub const SERVICE_DISPLAY_NAME: &str = "PSI: ODBC Rust Proxy (32-bit Bridge)";
 pub const SERVICE_DESCRIPTION: &str =
-    "Lekki serwer proxy HTTP mostkujący 32-bitowe źródła ODBC dla 64-bitowych aplikacji Java/JDBC.";
+    "Lekki serwer proxy HTTPS/HTTP mostkujący 32-bitowe źródła ODBC dla 64-bitowych aplikacji Java/JDBC.";
 
 define_windows_service!(ffi_service_main, my_service_main);
 
@@ -103,8 +103,26 @@ fn my_service_main(_arguments: Vec<OsString>) {
         }
     };
 
-    // Uruchomienie serwera HTTP Axum z obsługą graceful shutdown na kanale shutdown_rx
-    let server_result = rt.block_on(crate::run_server(shutdown_rx));
+    // Parsowanie konfiguracji (ENV + argumenty przekazane przy instalacji usługi)
+    let config = match crate::config::Config::from_env_and_args() {
+        Ok((_, cfg)) => cfg,
+        Err(e) => {
+            eprintln!("Błąd konfiguracji usługi: {}", e);
+            let _ = status_handle.set_service_status(ServiceStatus {
+                service_type: ServiceType::OWN_PROCESS,
+                current_state: ServiceState::Stopped,
+                controls_accepted: ServiceControlAccept::empty(),
+                exit_code: ServiceExitCode::Win32(1),
+                checkpoint: 0,
+                wait_hint: Duration::default(),
+                process_id: None,
+            });
+            return;
+        }
+    };
+
+    // Uruchomienie serwera HTTP/HTTPS Axum z obsługą graceful shutdown na kanale shutdown_rx
+    let server_result = rt.block_on(crate::run_server(shutdown_rx, config));
 
     // Zgłoszenie stanu Stopped do SCM
     let exit_code = match server_result {
@@ -128,13 +146,18 @@ fn my_service_main(_arguments: Vec<OsString>) {
 }
 
 /// Instaluje aplikację jako natywną usługę Windows z autostartem.
-pub fn install_service() -> anyhow::Result<()> {
+pub fn install_service(forward_args: &[String]) -> anyhow::Result<()> {
     let exe_path: PathBuf = std::env::current_exe()?;
     let manager = ServiceManager::local_computer(
         None::<&str>,
         ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
     )
     .map_err(|e| map_winapi_error(e, "Błąd łączenia z Service Control Manager"))?;
+
+    let mut launch_arguments = vec![OsString::from("--service")];
+    for arg in forward_args {
+        launch_arguments.push(OsString::from(arg));
+    }
 
     let service_info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
@@ -143,7 +166,7 @@ pub fn install_service() -> anyhow::Result<()> {
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
         executable_path: exe_path.clone(),
-        launch_arguments: vec![OsString::from("--service")],
+        launch_arguments,
         dependencies: vec![],
         account_name: None, // uruchamianie na koncie LocalSystem
         account_password: None,

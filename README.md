@@ -189,25 +189,60 @@ Zarządzanie usługą realizowane jest bezpośrednio z poziomu pliku `.exe` (wym
 > Usługa rejestrowana jest pod nazwą systemową `PsiOdbcRustProxy` oraz nazwą wyświetlaną `PSI: ODBC Rust Proxy (32-bit Bridge)`.
 > Można nią sterować również za pomocą standardowych narzędzi systemowych:
 > - Przystawka graficzna: `services.msc`
-> - Polecenia konsoli: `net start OdbcRustProxy` / `net stop OdbcRustProxy`
-> - PowerShell: `Start-Service OdbcRustProxy` / `Stop-Service OdbcRustProxy`
+> - Polecenia konsoli: `net start PsiOdbcRustProxy` / `net stop PsiOdbcRustProxy`
+> - PowerShell: `Start-Service PsiOdbcRustProxy` / `Stop-Service PsiOdbcRustProxy`
+
+---
+
+## Bezpieczeństwo i szyfrowanie TLS (Certificate Pinning)
+
+Proxy domyślnie pracuje w trybie **HTTPS (TLS 1.2 / 1.3 via `rustls` + `ring`)** na porcie **`8097`**, z polityką **Fail-Closed**: jeśli brakuje plików certyfikatu (`cert.pem`) lub klucza prywatnego (`key.pem`), serwer odmówi uruchomienia z czytelnym komunikatem błędu (nie uruchomi niezabezpieczonego HTTP bez wyraźnej zgody operatora).
+
+### 1. Generowanie certyfikatu (ważność 30 lat, z polem SAN)
+Nowoczesne silniki TLS (`rustls` oraz `java.net.http.HttpClient`) wymagają poprawnego pola **SAN (Subject Alternative Name)** w certyfikacie:
+
+```bash
+# W Git Bash na Windows użyj MSYS_NO_PATHCONV=1, aby ścieżka /CN=localhost nie została zmieniona:
+MSYS_NO_PATHCONV=1 openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout key.pem -out cert.pem -days 10950 \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost,IP:127.0.0.1"
+```
+*(Jeśli proxy będzie dostępne również zdalnie po sieci LAN, dopisz IP serwera do SAN, np. `subjectAltName=DNS:localhost,IP:127.0.0.1,IP:192.168.1.50`).*
+
+### 2. Rozmieszczenie plików
+* **Na serwerze (proxy Rust)**: Umieść oba pliki `cert.pem` oraz `key.pem` **w tym samym katalogu co plik `odbc-rust-proxy.exe`** (jest to szczególnie istotne przy pracy jako usługa Windows, której domyślny katalog roboczy to `System32` / `SysWOW64`), albo wskaż je przez `--tls-cert` / `--tls-key` lub zmienne środowiskowe `ODBC_TLS_CERT` / `ODBC_TLS_KEY`.
+* **Po stronie klienta (Java)**: Dystrybuuj **wyłącznie plik `cert.pem`** (klucz `key.pem` nigdy nie opuszcza serwera proxy).
+* **Uwaga o `.gitignore`**: Nigdy nie commituj pliku `key.pem` do repozytorium Git.
 
 ---
 
 ## Konfiguracja
 
-Aplikacja jest konfigurowana za pomocą zmiennych środowiskowych:
+Aplikacja jest konfigurowana za pomocą zmiennych środowiskowych oraz flag wiersza poleceń (CLI ma pierwszeństwo przed zmiennymi środowiskowymi):
 
-| Zmienna środowiskowa | Domyślna wartość | Opis |
-|---|---|---|
-| `ODBC_PROXY_ADDR` | `127.0.0.1:8097` | Adres IP oraz port, na którym nasłuchuje serwer HTTP proxy. |
-| `ODBC_IDLE_TIMEOUT_SECS` | `1800` | Czas w sekundach (domyślnie 30 minut), po którym porzucona bezczynna sesja jest automatycznie zamykana przez Reapera. |
+| Zmienna środowiskowa | Flaga CLI | Domyślna wartość | Opis |
+|---|---|---|---|
+| `ODBC_PROXY_ADDR` / `BIND_ADDR` | `-b`, `--bind`, `-a`, `--addr` | `127.0.0.1:8097` | Adres IP oraz port, na którym nasłuchuje serwer proxy. |
+| `ODBC_PROXY_PORT` / `PORT` | `-p`, `--port` | `8097` | Port nasłuchiwania serwera proxy. |
+| `ODBC_TLS_ENABLED` | `--no-tls` | `true` | Domyślnie `true` (wymagany HTTPS). Flaga `--no-tls` lub `false` uruchamia czyste HTTP (wyłącznie do lokalnych testów). |
+| `ODBC_TLS_CERT` | `--tls-cert` | `<katalog_exe>/cert.pem` | Ścieżka do pliku certyfikatu X.509 w formacie PEM. |
+| `ODBC_TLS_KEY` | `--tls-key` | `<katalog_exe>/key.pem` | Ścieżka do pliku klucza prywatnego w formacie PEM. |
+| `ODBC_IDLE_TIMEOUT_SECS` | – | `1800` | Czas w sekundach (domyślnie 30 minut), po którym porzucona bezczynna sesja jest automatycznie zamykana przez Reapera. |
 
-### Przykład uruchomienia z własnymi parametrami (PowerShell):
+### Przykłady uruchomienia (PowerShell):
 ```powershell
-$env:ODBC_PROXY_ADDR = "127.0.0.1:9000"
-$env:ODBC_IDLE_TIMEOUT_SECS = "600" # 10 minut
-.\target\release\odbc-rust-proxy.exe
+# Domyślny start HTTPS (127.0.0.1:8097) z plikami cert.pem i key.pem obok .exe:
+.\odbc-rust-proxy.exe
+
+# Start HTTPS ze wskazaniem własnych ścieżek i portu:
+.\odbc-rust-proxy.exe --addr 127.0.0.1:8443 --tls-cert C:\certs\cert.pem --tls-key C:\certs\key.pem
+
+# Instalacja jako usługa Windows z jawnymi ścieżkami (konwertowane automatycznie na bezwzględne):
+.\odbc-rust-proxy.exe install --tls-cert C:\certs\cert.pem --tls-key C:\certs\key.pem
+
+# Start bez szyfrowania (wyłącznie do testów lokalnych):
+.\odbc-rust-proxy.exe --no-tls
 ```
 
 ---
@@ -544,7 +579,7 @@ Wykonuje instrukcję modyfikującą dane (`INSERT`, `UPDATE`, `DELETE`, `CREATE 
 Zarówno w trybie konsolowym (przy wciśnięciu `Ctrl+C`), jak i w trybie usługi Windows (przy wysłaniu sygnału `Stop` z poziomu `services.msc`, `net stop` lub `odbc-rust-proxy.exe stop`):
 
 1. Windows Service Control Manager wysyła sygnał `SERVICE_CONTROL_STOP` do procedury obsługi zdarzeń.
-2. Serwer HTTP Axum natychmiast przestaje przyjmować nowe połączenia przy użyciu procedury `with_graceful_shutdown`.
+2. Serwer HTTPS/HTTP (`axum-server`) natychmiast przestaje przyjmować nowe połączenia poprzez `axum_server::Handle::graceful_shutdown` (dając do 10 s na dokończenie bieżących zapytań).
 3. Mechanizm Session Managera iteruje po wszystkich aktywnych sesjach ODBC (`close_all_sessions`), wysyła żądanie wycofania transakcji (`ROLLBACK`), zwalnia aktywne kursory i bezpiecznie rozłącza uchwyty ODBC (`SQLDisconnect`).
 4. Wątki sesyjne OS kończą pracę i zwalniają pamięć systemową.
 5. Usługa zgłasza do SCM stan `SERVICE_STOPPED` z kodem wyjścia 0 i proces kończy działanie.

@@ -1,1 +1,7 @@
 /target
+*.pem
+*.key
+*.crt
+*.p12
+*.jks
+

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod config;
 mod encoding;
 mod service;
 mod session;
@@ -22,11 +23,14 @@ use axum::{
     routing::post,
     Json, Router,
 };
+use axum_server::tls_rustls::RustlsConfig;
 use odbc_api::Environment;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::{CliAction, Config};
 use crate::session::{
     ExecuteResponse, FetchResponse, QueryResponse, SessionCommand, SessionManager,
 };
@@ -118,35 +122,30 @@ struct AppState {
 }
 
 fn main() -> anyhow::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    let cmd = args.get(1).map(|s| s.as_str());
+    let (action, config) = match Config::from_env_and_args() {
+        Ok(res) => res,
+        Err(e) => {
+            eprintln!("Błąd konfiguracji:\n{}\n", e);
+            std::process::exit(1);
+        }
+    };
 
-    match cmd {
-        Some("--service") => {
+    match action {
+        CliAction::ServiceWorker => {
             // Uruchomienie pod kontrolą Windows Service Control Manager (SCM)
             service::run_service()?;
             Ok(())
         }
-        Some("install") => {
-            service::install_service()
-        }
-        Some("uninstall") => {
-            service::uninstall_service()
-        }
-        Some("start") => {
-            service::start_service()
-        }
-        Some("stop") => {
-            service::stop_service()
-        }
-        Some("status") => {
-            service::query_service_status()
-        }
-        Some("--help") | Some("-h") | Some("help") => {
-            print_help();
+        CliAction::Install { forward_args } => service::install_service(&forward_args),
+        CliAction::Uninstall => service::uninstall_service(),
+        CliAction::Start => service::start_service(),
+        CliAction::Stop => service::stop_service(),
+        CliAction::Status => service::query_service_status(),
+        CliAction::Help => {
+            Config::print_help();
             Ok(())
         }
-        Some("run") | None => {
+        CliAction::Run => {
             // Tryb interaktywny w konsoli (Standalone)
             println!("Uruchamianie serwera w trybie interaktywnym (konsola)...");
             println!("Wciśnij Ctrl+C, aby zatrzymać serwer.\n");
@@ -164,45 +163,68 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
 
-                run_server(shutdown_rx).await
+                run_server(shutdown_rx, config).await
             })
-        }
-        Some(unknown) => {
-            eprintln!("Nieznane polecenie: '{}'\n", unknown);
-            print_help();
-            std::process::exit(1);
         }
     }
 }
 
-fn print_help() {
-    println!("ODBC Rust Proxy - 32-bit ODBC HTTP Bridge");
-    println!("========================================");
-    println!("UŻYCIE:");
-    println!("  odbc-rust-proxy.exe [POLECENIE]");
-    println!();
-    println!("POLECENIA:");
-    println!("  (brak) / run       Uruchamia serwer w konsoli (tryb Standalone, Ctrl+C zatrzymuje)");
-    println!("  install            Instaluje program jako natywną usługę Windows (AutoStart)");
-    println!("  uninstall          Zatrzymuje i odinstalowuje usługę Windows");
-    println!("  start              Uruchamia zarejestrowaną usługę Windows");
-    println!("  stop               Zatrzymuje usługę Windows");
-    println!("  status             Sprawdza status usługi Windows");
-    println!("  --service          Flaga wewnętrzna używana przez Windows Service Manager");
-    println!("  --help, -h         Wyświetla ten komunikat pomocy");
-    println!();
-    println!("ZMIENNE ŚRODOWISKOWE:");
-    println!("  ODBC_PROXY_ADDR         Adres i port nasłuchiwania (domyślnie: 127.0.0.1:8097)");
-    println!("  ODBC_IDLE_TIMEOUT_SECS  Czas bezczynności sesji w sekundach przed jej zamknięciem (domyślnie: 1800)");
+async fn resolve_socket_addr(addr_str: &str) -> anyhow::Result<SocketAddr> {
+    if let Ok(sa) = addr_str.parse::<SocketAddr>() {
+        return Ok(sa);
+    }
+
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr_str)
+        .await
+        .map_err(|e| anyhow::anyhow!("Nie można rozwiązać adresu '{}': {}", addr_str, e))?
+        .collect();
+
+    if let Some(ipv4) = addrs.iter().find(|a| a.is_ipv4()) {
+        return Ok(*ipv4);
+    }
+
+    addrs
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Brak wyników DNS dla adresu '{}'", addr_str))
 }
 
-pub async fn run_server(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> anyhow::Result<()> {
+pub async fn run_server(
+    shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    config: Config,
+) -> anyhow::Result<()> {
     if cfg!(not(target_pointer_width = "32")) {
         eprintln!("OSTRZEŻENIE: Serwer został skompilowany jako 64-bit!");
         eprintln!("Aby widzieć 32-bitowe źródła ODBC, skompiluj z flagą: cargo build --release --target i686-pc-windows-msvc");
     } else {
         println!("Architektura procesu: 32-bit (x86) - gotowy do obsługi 32-bitowych sterowników ODBC.");
     }
+
+    // Weryfikacja i wczytanie certyfikatów TLS przed inicjalizacją ODBC (Opcja A: Fail-Closed)
+    let tls_config = if config.tls_enabled {
+        let (cert_path, key_path) = config
+            .resolve_tls_paths()
+            .map_err(|msg| anyhow::anyhow!("{}", msg))?;
+
+        println!("Wczytywanie certyfikatu TLS: {}", cert_path.display());
+        println!("Wczytywanie klucza TLS:      {}", key_path.display());
+
+        let cfg = RustlsConfig::from_pem_file(&cert_path, &key_path)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Błąd wczytywania certyfikatu/klucza TLS (cert: '{}', key: '{}'): {}",
+                    cert_path.display(),
+                    key_path.display(),
+                    e
+                )
+            })?;
+        Some(cfg)
+    } else {
+        None
+    };
+
+    let socket_addr = resolve_socket_addr(&config.socket_addr_str()).await?;
 
     let env = Environment::new()?;
     let manager = Arc::new(SessionManager::new(env));
@@ -211,20 +233,20 @@ pub async fn run_server(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> anyh
     });
 
     // Zadanie w tle czyszczące porzucone sesje (konfigurowalny timeout, domyślnie 30 minut)
-    let idle_timeout_secs = std::env::var("ODBC_IDLE_TIMEOUT_SECS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(1800);
+    let idle_timeout_secs = config.idle_timeout_secs;
     let reaper_mgr = Arc::clone(&manager);
     let reaper_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(60));
         loop {
             interval.tick().await;
-            reaper_mgr.cleanup_idle_sessions(Duration::from_secs(idle_timeout_secs)).await;
+            reaper_mgr
+                .cleanup_idle_sessions(Duration::from_secs(idle_timeout_secs))
+                .await;
         }
     });
 
     let app = Router::new()
+        .route("/ping", axum::routing::get(|| async { "pong" }))
         // Endpointy sesyjne (pełne wsparcie JDBC i transakcji)
         .route("/session/connect", post(handle_session_connect))
         .route("/session/autocommit", post(handle_session_autocommit))
@@ -239,17 +261,34 @@ pub async fn run_server(shutdown_rx: tokio::sync::oneshot::Receiver<()>) -> anyh
         .route("/execute", post(handle_execute))
         .with_state(state);
 
-    let default_addr = "127.0.0.1:8097";
-    let addr = std::env::var("ODBC_PROXY_ADDR").unwrap_or_else(|_| default_addr.to_string());
-    println!("Serwer Rust ODBC Proxy nasłuchuje na http://{}", addr);
+    let handle = axum_server::Handle::new();
+    let shutdown_handle = handle.clone();
+    tokio::spawn(async move {
+        let _ = shutdown_rx.await;
+        println!("Odebrano sygnał zatrzymania serwera. Rozpoczynanie zamykania połączeń...");
+        shutdown_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+    });
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            let _ = shutdown_rx.await;
-            println!("Odebrano sygnał zatrzymania serwera. Rozpoczynanie zamykania połączeń...");
-        })
-        .await?;
+    match tls_config {
+        Some(rustls_cfg) => {
+            println!(
+                "Serwer Rust ODBC Proxy nasłuchuje na https://{} (TLS / Certificate Pinning)",
+                socket_addr
+            );
+            axum_server::bind_rustls(socket_addr, rustls_cfg)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+        None => {
+            eprintln!("OSTRZEŻENIE: Szyfrowanie TLS zostało jawnie wyłączone (--no-tls / ODBC_TLS_ENABLED=false)!");
+            println!("Serwer Rust ODBC Proxy nasłuchuje na http://{}", socket_addr);
+            axum_server::bind(socket_addr)
+                .handle(handle)
+                .serve(app.into_make_service())
+                .await?;
+        }
+    }
 
     reaper_handle.abort();
     manager.close_all_sessions().await;
